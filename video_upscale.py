@@ -179,42 +179,42 @@ def main():
 
     # Extract frames
     tmpdir = Path(tempfile.mkdtemp(prefix="esrgan_"))
-    frames_dir = tmpdir / "frames"
-    upscaled_dir = tmpdir / "upscaled"
-    frames_dir.mkdir()
-    upscaled_dir.mkdir()
+    try:
+        frames_dir = tmpdir / "frames"
+        upscaled_dir = tmpdir / "upscaled"
+        frames_dir.mkdir()
+        upscaled_dir.mkdir()
 
-    print(f"Extracting frames from {input_path} ({w}x{h}, {fps} fps)...")
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(input_path), str(frames_dir / "frame_%04d.png")],
-        capture_output=True
-    )
-    n_frames = len(list(frames_dir.glob("frame_*.png")))
-    print(f"Extracted {n_frames} frames")
+        print(f"Extracting frames from {input_path} ({w}x{h}, {fps} fps)...")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(input_path), str(frames_dir / "frame_%04d.png")],
+            capture_output=True
+        )
+        n_frames = len(list(frames_dir.glob("frame_*.png")))
+        print(f"Extracted {n_frames} frames")
 
-    # Upscale
-    print(f"Upscaling with {args.model} (tile={args.tile_size}, scale={scale}x)...")
-    t0 = time.time()
-    process_frames_with_io(
-        frames_dir, upscaled_dir,
-        model_name=args.model, compute_unit="CPU_AND_GPU", fp16=True,
-        model_size=model_size, scale=scale,
-        tile_size=args.tile_size, tile_overlap=args.tile_overlap,
-    )
-    elapsed = time.time() - t0
-    print(f"Upscaled {n_frames} frames in {elapsed:.1f}s ({elapsed/n_frames:.2f}s/frame)")
+        # Upscale
+        print(f"Upscaling with {args.model} (tile={args.tile_size}, scale={scale}x)...")
+        t0 = time.time()
+        process_frames_with_io(
+            frames_dir, upscaled_dir,
+            model_name=args.model, compute_unit="CPU_AND_GPU", fp16=True,
+            model_size=model_size, scale=scale,
+            tile_size=args.tile_size, tile_overlap=args.tile_overlap,
+        )
+        elapsed = time.time() - t0
+        print(f"Upscaled {n_frames} frames in {elapsed:.1f}s ({elapsed/n_frames:.2f}s/frame)")
 
-    # Reassemble video
-    print("Encoding output video...")
-    subprocess.run([
-        "ffmpeg", "-y", "-framerate", fps,
-        "-i", str(upscaled_dir / "frame_%04d.png"),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "fast",
-        str(output_path),
-    ], capture_output=True)
-
-    # Cleanup
-    shutil.rmtree(tmpdir)
+        # Reassemble video
+        print("Encoding output video...")
+        subprocess.run([
+            "ffmpeg", "-y", "-framerate", fps,
+            "-i", str(upscaled_dir / "frame_%04d.png"),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "fast",
+            str(output_path),
+        ], capture_output=True)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     out_w, out_h = w * scale, h * scale
     print(f"Done: {w}x{h} -> {out_w}x{out_h}, saved to {output_path}")
