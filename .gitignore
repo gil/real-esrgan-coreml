@@ -2,3 +2,5 @@ weights/*.mlpackage
 weights/*.pth
 weights/*.zip
 __pycache__/
+.DS_Store
+weights
