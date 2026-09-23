@@ -8,6 +8,7 @@ set -euo pipefail
 # here must be 20 below the model size. Change to 10 after fixing it.
 MODEL_SLACK=20
 STOCK_MODEL=522
+FRAME_PAT="frame_%06d.png"
 
 MODEL=x2plus
 HEIGHT=720
@@ -68,7 +69,14 @@ Usage: upscale-video.sh [options] INPUT
 
   -o FILE         output path (default: <input>_upscaled.mkv)
                   .mkv copies audio losslessly, .mp4 transcodes to AAC
-  -m MODEL        x4plus|x2plus|anime_6B|animevideo|general (default: x2plus)
+  -m MODEL[,...]  x4plus|x2plus|anime_6B|animevideo|general|nomos2_otf
+                  |vhs_2x|genesis_cleanup (default: x2plus)
+                  genesis_cleanup is 1x: it cleans without upscaling
+                  Comma separated runs a chain in order, frames stay lossless
+                  between passes, e.g. -m genesis_cleanup,vhs_2x
+                  Output scale is capped at the largest single model scale,
+                  so two 2x models still land at 2x, not 4x
+                  --eval writes one file per pass for comparison
   -H N            target output height (default: 720)
   -c N            chunk length in seconds (default: 30)
   --crf N         x264 quality, lower is better (default: 17)
@@ -167,6 +175,11 @@ HAS_AUDIO=$(ffprobe -v error -select_streams a -show_entries stream=index \
 HAS_COVER=$(ffprobe -v error -select_streams v -show_entries stream_disposition=attached_pic \
   -of default=nk=1:nw=1 "$INPUT" 2>/dev/null | grep -c '^1$' || true)
 
+# Rebuilding video from a PNG sequence needs an explicit rate. Keep it as the
+# exact rational (30000/1001, not 29.97) so chunk durations stay put.
+SRC_FPS=$(probe r_frame_rate "$INPUT")
+[[ -z "$SRC_FPS" || "$SRC_FPS" == "0/0" ]] && SRC_FPS=25
+
 CSP=$(probe color_space "$INPUT")
 CPRIM=$(probe color_primaries "$INPUT")
 CTRC=$(probe color_transfer "$INPUT")
@@ -184,6 +197,33 @@ if [ -n "$CSP" ]    && [ "$CSP" != unknown ];    then addparam "colorspace=$CSP"
 if [ -n "$CPRIM" ]  && [ "$CPRIM" != unknown ];  then addparam "color_primaries=$CPRIM"; fi
 if [ -n "$CTRC" ]   && [ "$CTRC" != unknown ];   then addparam "color_trc=$CTRC"; fi
 if [ -n "$CRANGE" ] && [ "$CRANGE" != unknown ]; then addparam "range=$CRANGE"; fi
+
+IFS=, read -r -a MODELS <<<"$MODEL"
+N_MODELS=${#MODELS[@]}
+(( N_MODELS > 0 )) || die "-m needs at least one model name"
+
+# Resolve the chain up front so a typo fails in seconds rather than an hour in.
+# Output scale is capped at the largest single model scale, not the product.
+CHAIN=$(uv run python -c '
+import sys
+from upscale import MODEL_CONFIGS
+from video_upscale import resolve_chain
+names = sys.argv[1:]
+bad = [n for n in names if n not in MODEL_CONFIGS]
+if bad:
+    print("unknown model(s): %s" % ", ".join(bad))
+    print("available: %s" % ", ".join(MODEL_CONFIGS))
+    sys.exit(1)
+try:
+    plan, final = resolve_chain(names)
+except ValueError as e:
+    print(str(e))
+    sys.exit(1)
+print(final)
+for n, s, f in plan:
+    print("%s %d %d" % (n, s, f))
+' "${MODELS[@]}" 2>/dev/null) || die "${CHAIN:-could not resolve model chain}"
+FINAL_SCALE=$(printf '%s\n' "$CHAIN" | head -1)
 
 rule
 step "Source"
@@ -234,19 +274,49 @@ fi
 MAXDIM=$(( CROP_W > CROP_H ? CROP_W : CROP_H ))
 
 step "Model"
+while read -r m_name m_scale m_factor; do
+  if (( m_factor > 1 )); then
+    detail "${m_name} (${m_scale}x), area downscale by ${m_factor} first"
+  else
+    detail "${m_name} (${m_scale}x)"
+  fi
+done < <(printf '%s\n' "$CHAIN" | tail -n +2)
+
+# --fit needs a model built for the exact frame it sees. The scale cap keeps
+# every pass at source size unless a smaller-scale model follows a bigger one,
+# which leaves that pass a frame too large to share the same model.
+FIT_OK=1
+fit_w=$CROP_W; fit_h=$CROP_H; fit_first=""
+while read -r m_name m_scale m_factor; do
+  fit_w=$(( fit_w / m_factor )); fit_h=$(( fit_h / m_factor ))
+  fit_size=$(( fit_w > fit_h ? fit_w : fit_h ))
+  [[ -z "$fit_first" ]] && fit_first=$fit_size
+  (( fit_size == fit_first )) || FIT_OK=0
+  fit_w=$(( fit_w * m_scale )); fit_h=$(( fit_h * m_scale ))
+done < <(printf '%s\n' "$CHAIN" | tail -n +2)
+
+if [[ $FIT -eq 1 && $FIT_OK -eq 0 ]]; then
+  warn "--fit ignored: this chain hands one pass a larger frame than the others"
+  FIT=0
+fi
+
 if [[ $FIT -eq 1 ]]; then
   TILE=$MAXDIM
   MODEL_SIZE=$(( MAXDIM + MODEL_SLACK ))
-  MLPKG="weights/RealESRGAN_${MODEL}_${MODEL_SIZE}_fp16.mlpackage"
-  if [[ ! -d "$MLPKG" ]]; then
-    detail "converting ${MODEL} at ${MODEL_SIZE}px, one time, needs torch"
-    run uv run --extra convert python convert.py --model "$MODEL" --size "$MODEL_SIZE"
-  fi
-  detail "${MODEL} @ ${MODEL_SIZE}px, one inference per frame, no seams"
+  detail "output ${FINAL_SCALE}x, @ ${MODEL_SIZE}px, one inference per frame, no seams"
 else
   TILE=$(( STOCK_MODEL - MODEL_SLACK ))
-  detail "${MODEL} @ ${STOCK_MODEL}px, tile ${TILE}"
+  MODEL_SIZE=$STOCK_MODEL
+  detail "output ${FINAL_SCALE}x, @ ${STOCK_MODEL}px, tile ${TILE}"
 fi
+
+for m in "${MODELS[@]}"; do
+  MLPKG="weights/RealESRGAN_${m}_${MODEL_SIZE}_fp16.mlpackage"
+  [[ -d "$MLPKG" ]] && continue
+  detail "preparing ${m} at ${MODEL_SIZE}px, downloads or converts once"
+  run uv run --extra convert python -c \
+    "from upscale import ensure_model; ensure_model('${m}', ${MODEL_SIZE})"
+done
 
 TMPBASE="${TMPDIR:-/tmp}"; TMPBASE="${TMPBASE%/}"
 WORK=$(mktemp -d "${TMPBASE}/upscale_XXXXXX")
@@ -316,6 +386,29 @@ else
 fi
 [[ -n "$SETPARAMS" ]] && VF="${VF},${SETPARAMS}"
 
+# Per-pass eval dumps share the final height and crf but skip cas and grain, so
+# the only thing varying between them is how far down the chain you are.
+DUMP_VF="scale=-2:${HEIGHT}:flags=lanczos"
+[[ -n "$SETPARAMS" ]] && DUMP_VF="${DUMP_VF},${SETPARAMS}"
+
+KEEP_PASSES=()
+[[ $EVAL -eq 1 ]] && KEEP_PASSES=(--keep-passes)
+FIT_ARG=()
+[[ $FIT -eq 1 ]] && FIT_ARG=(--fit)
+
+dump_passes() {
+  local i name dir dest
+  for (( i = 1; i <= N_MODELS; i++ )); do
+    name="${MODELS[$((i - 1))]}"
+    if (( i == N_MODELS )); then dir="$WORK/up/final"; else dir="$WORK/up/pass${i}_${name}"; fi
+    [[ -d "$dir" ]] || continue
+    dest="${OUTPUT%.*}_pass${i}_${name}.mkv"
+    step "Dumping pass ${i} (${name})"
+    run ffmpeg -v error -y -framerate "$SRC_FPS" -i "${dir}/${FRAME_PAT}" -vf "$DUMP_VF" \
+      -c:v libx264 -crf "$CRF" -preset slow -tune film -pix_fmt yuv420p -an "$dest"
+  done
+}
+
 PRE_VF=""
 [[ -n "$CROP_FILTER" ]] && PRE_VF="$CROP_FILTER"
 if [[ -n "$DENOISE" ]]; then
@@ -325,7 +418,7 @@ fi
 # Provenance. ENCODER is not usable: the muxer overwrites whatever you set, so
 # a custom tag is the only field that survives. Matroska keeps arbitrary tags;
 # MP4 drops most of them.
-NOTE="real-esrgan ${MODEL}"
+NOTE="real-esrgan ${MODEL} (${FINAL_SCALE}x)"
 [[ -n "$CROP_FILTER" ]] && NOTE="${NOTE}; ${CROP_FILTER}"
 [[ -n "$DENOISE" ]]     && NOTE="${NOTE}; hqdn3d=${DENOISE}"
 NOTE="${NOTE}; lanczos to ${HEIGHT}p"
@@ -356,14 +449,19 @@ for chunk in "${CHUNKS[@]}"; do
     feed="$chunk"
   fi
 
-  run uv run python video_upscale.py "$feed" -o "$WORK/big.mp4" \
-    --model "$MODEL" --tile-size "$TILE"
+  # Frames come back as PNG rather than a video: an intermediate encode here
+  # would throw away model detail before the final one ever sees it.
+  run uv run python video_upscale.py "$feed" --frames-dir "$WORK/up" \
+    --model "$MODEL" --tile-size "$TILE" \
+    ${FIT_ARG[@]+"${FIT_ARG[@]}"} ${KEEP_PASSES[@]+"${KEEP_PASSES[@]}"}
 
-  run ffmpeg -v error -y -i "$WORK/big.mp4" -vf "$VF" \
+  run ffmpeg -v error -y -framerate "$SRC_FPS" -i "$WORK/up/final/${FRAME_PAT}" -vf "$VF" \
     -c:v libx264 -crf "$CRF" -preset slow -tune "$TUNE" -pix_fmt yuv420p \
     -an "$final"
 
-  rm -f "$WORK/big.mp4" "$WORK/prep.mkv"
+  [[ $EVAL -eq 1 ]] && dump_passes
+
+  rm -rf "$WORK/up" "$WORK/prep.mkv"
   detail "chunk done in $(( $(date +%s) - t0 ))s"
 done
 
