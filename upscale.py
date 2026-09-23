@@ -28,6 +28,9 @@ MODEL_CONFIGS = {
     "anime_6B": dict(scale=4),
     "animevideo": dict(scale=4),
     "general": dict(scale=4),
+    "nomos2_otf": dict(scale=4),
+    "vhs_2x": dict(scale=2),
+    "genesis_cleanup": dict(scale=1),
 }
 
 

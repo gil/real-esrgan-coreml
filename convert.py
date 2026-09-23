@@ -44,6 +44,24 @@ MODEL_CONFIGS = {
         url="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
         pth_stem="realesr-general-x4v3",
     ),
+    "nomos2_otf": dict(
+        arch="rrdb", num_in_ch=3, num_out_ch=3, scale=4,
+        num_feat=64, num_block=23, num_grow_ch=32,
+        keymap="esrgan_old",
+        pth_stem="4xNomos2_otf_esrgan",
+    ),
+    "vhs_2x": dict(
+        arch="rrdb", num_in_ch=3, num_out_ch=3, scale=2,
+        num_feat=64, num_block=23, num_grow_ch=32,
+        unshuffle=False, num_upsample=1,
+        keymap="esrgan_old",
+        pth_stem="2x_VHS-upscale-and-denoise_Film_477000_G",
+    ),
+    "genesis_cleanup": dict(
+        arch="srvgg", num_in_ch=3, num_out_ch=3,
+        num_feat=96, num_conv=24, upscale=1,
+        pth_stem="Genesis_Cleanup_compact",
+    ),
 }
 
 
@@ -54,8 +72,13 @@ def download_pth(model_name: str) -> Path:
     if pth_path.exists():
         print(f"Found cached {pth_path}")
         return pth_path
+    url = config.get("url")
+    if not url:
+        raise FileNotFoundError(
+            f"{pth_path} not found and {model_name} has no download url. "
+            f"Place the .pth there manually."
+        )
     WEIGHTS_DIR.mkdir(exist_ok=True)
-    url = config["url"]
     print(f"Downloading {url} ...")
 
     def progress(count, block_size, total_size):
@@ -67,8 +90,14 @@ def download_pth(model_name: str) -> Path:
     return pth_path
 
 
-def build_torch_rrdb(num_in_ch=3, num_out_ch=3, scale=4, num_feat=64, num_block=23, num_grow_ch=32):
-    """Build PyTorch RRDBNet without importing basicsr (inline definition)."""
+def build_torch_rrdb(num_in_ch=3, num_out_ch=3, scale=4, num_feat=64, num_block=23,
+                     num_grow_ch=32, unshuffle=None, num_upsample=2):
+    """Build PyTorch RRDBNet without importing basicsr (inline definition).
+
+    Real-ESRGAN's x2plus reaches 2x by pixel_unshuffling the input then running
+    two upsample blocks. Original-ESRGAN 2x weights instead feed 3 channels
+    straight in and use a single upsample block, so both knobs are explicit.
+    """
     import torch
     import torch.nn as tnn
     import torch.nn.functional as F
@@ -104,31 +133,35 @@ def build_torch_rrdb(num_in_ch=3, num_out_ch=3, scale=4, num_feat=64, num_block=
             out = self.rdb3(out)
             return out * 0.2 + x
 
+    do_unshuffle = (scale == 2) if unshuffle is None else unshuffle
+
     class _RRDBNet(tnn.Module):
         def __init__(self):
             super().__init__()
-            self.scale = scale
-            # For scale=2, pixel_unshuffle increases channels by 4x
-            first_in_ch = num_in_ch * 4 if scale == 2 else num_in_ch
+            self.unshuffle = do_unshuffle
+            self.num_upsample = num_upsample
+            first_in_ch = num_in_ch * 4 if do_unshuffle else num_in_ch
             self.conv_first = tnn.Conv2d(first_in_ch, num_feat, 3, 1, 1)
             self.body = tnn.Sequential(*[_RRDB() for _ in range(num_block)])
             self.conv_body = tnn.Conv2d(num_feat, num_feat, 3, 1, 1)
             self.conv_up1 = tnn.Conv2d(num_feat, num_feat, 3, 1, 1)
-            self.conv_up2 = tnn.Conv2d(num_feat, num_feat, 3, 1, 1)
+            if num_upsample >= 2:
+                self.conv_up2 = tnn.Conv2d(num_feat, num_feat, 3, 1, 1)
             self.conv_hr = tnn.Conv2d(num_feat, num_feat, 3, 1, 1)
             self.conv_last = tnn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
             self.lrelu = tnn.LeakyReLU(0.2, True)
 
         def forward(self, x):
-            if self.scale == 2:
+            if self.unshuffle:
                 x = F.pixel_unshuffle(x, 2)
             feat = self.conv_first(x)
             body_feat = self.conv_body(self.body(feat))
             feat = feat + body_feat
             feat = self.lrelu(self.conv_up1(
                 torch.nn.functional.interpolate(feat, scale_factor=2, mode='nearest')))
-            feat = self.lrelu(self.conv_up2(
-                torch.nn.functional.interpolate(feat, scale_factor=2, mode='nearest')))
+            if self.num_upsample >= 2:
+                feat = self.lrelu(self.conv_up2(
+                    torch.nn.functional.interpolate(feat, scale_factor=2, mode='nearest')))
             return self.conv_last(self.lrelu(self.conv_hr(feat)))
 
     return _RRDBNet()
@@ -162,12 +195,55 @@ def build_torch_srvgg(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=16, upsca
             out = x
             for i in range(len(self.body)):
                 out = self.body[i](out)
-            out = self.upsampler(out)
-            base = F.interpolate(x, scale_factor=self.upscale, mode='nearest')
-            out += base
+            # At 1x the pixel shuffle and the nearest resize are both identities;
+            # skipping them keeps the traced graph free of no-op resize layers.
+            if self.upscale > 1:
+                out = self.upsampler(out)
+                out = out + F.interpolate(x, scale_factor=self.upscale, mode='nearest')
+            else:
+                out = out + x
             return out
 
     return _SRVGGNetCompact()
+
+
+def remap_esrgan_old(state_dict, num_upsample=2):
+    """Rename old-ESRGAN keys to RRDBNet attribute names.
+
+    Checkpoints from the original ESRGAN repo (and most OpenModelDB weights)
+    name layers by nn.Sequential index: model.0, model.1.sub.N.RDBj.convk.0,
+    then the tail. The last sub index is conv_body, not an RRDB block. Each
+    upsample block shifts the tail indices, so 2x and 4x nets differ there.
+    """
+    import re
+
+    if num_upsample >= 2:
+        tail = {"3": "conv_up1", "6": "conv_up2", "8": "conv_hr", "10": "conv_last"}
+    else:
+        tail = {"3": "conv_up1", "5": "conv_hr", "7": "conv_last"}
+    sub_ids = [int(m.group(1)) for k in state_dict
+               for m in [re.match(r"model\.1\.sub\.(\d+)\.", k)] if m]
+    trunk = max(sub_ids)
+
+    out = {}
+    for k, v in state_dict.items():
+        if k.startswith("model.0."):
+            nk = "conv_first." + k[len("model.0."):]
+        elif k.startswith(f"model.1.sub.{trunk}."):
+            nk = "conv_body." + k[len(f"model.1.sub.{trunk}."):]
+        elif k.startswith("model.1.sub."):
+            nk, n = re.subn(
+                r"model\.1\.sub\.(\d+)\.RDB(\d)\.conv(\d)\.0\.",
+                lambda m: f"body.{m.group(1)}.rdb{m.group(2)}.conv{m.group(3)}.", k)
+            if n == 0:
+                raise ValueError(f"unmapped ESRGAN key: {k}")
+        else:
+            m = re.match(r"model\.(\d+)\.", k)
+            if not m or m.group(1) not in tail:
+                raise ValueError(f"unmapped ESRGAN key: {k}")
+            nk = tail[m.group(1)] + "." + k[m.end():]
+        out[nk] = v
+    return out
 
 
 def get_mlpackage_name(model_name: str, input_size: int, fp16: bool) -> str:
@@ -194,6 +270,7 @@ def convert(model_name: str = "x4plus", input_size: int = 512, use_fp16: bool = 
             num_in_ch=config["num_in_ch"], num_out_ch=config["num_out_ch"],
             scale=config["scale"], num_feat=config["num_feat"],
             num_block=config["num_block"], num_grow_ch=config["num_grow_ch"],
+            unshuffle=config.get("unshuffle"), num_upsample=config.get("num_upsample", 2),
         )
     else:
         model = build_torch_srvgg(
@@ -204,6 +281,11 @@ def convert(model_name: str = "x4plus", input_size: int = 512, use_fp16: bool = 
 
     checkpoint = torch.load(str(pth_path), map_location="cpu", weights_only=True)
     state_dict = checkpoint.get("params_ema", checkpoint.get("params", checkpoint))
+    if config.get("keymap") == "esrgan_old":
+        state_dict = remap_esrgan_old(state_dict, config.get("num_upsample", 2))
+    # Community weights are often stored fp16; the traced module is fp32.
+    state_dict = {k: (v.float() if v.is_floating_point() else v)
+                  for k, v in state_dict.items()}
     model.load_state_dict(state_dict, strict=True)
     model.eval()
 
